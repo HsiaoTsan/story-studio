@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
 from dataclasses import dataclass
 import gzip
@@ -13,11 +14,15 @@ from pathlib import Path
 import struct
 import subprocess
 import uuid
+from urllib.parse import quote
 
 from studio_runtime import activate_runtime, find_executable
 from voice_settings import VoiceConfigError, load_profile, read_api_key, validate_profile
 
 URL = "wss://openspeech.bytedance.com/api/v3/tts/bidirection"
+# Doubao TTS 3.0 uses a different endpoint and a JSON event protocol.
+URL_V3 = "wss://voice.cn-beijing.volces.com/api/v3/text-to-speech/{voice}/streaming-input"
+MODEL_V3 = "doubao-seed-tts-3.0"
 CONNECTION_EVENTS = {1, 2, 50, 51, 52}
 
 
@@ -172,15 +177,87 @@ async def stream_session(socket, text: str, profile: dict, target) -> int:
             await sender
 
 
+def rate_to_multiplier(rate: int) -> float:
+    """Map the 2.0-style -50..100 rate onto 3.0's 0.5..2.0 multiplier (0 -> 1.0)."""
+    return round(min(2.0, max(0.5, 1 + rate / 100)), 2)
+
+
+def v3_init(profile: dict) -> dict:
+    # language_code is left at the service default "auto": the cn-beijing region rejects "zh-CN".
+    return {"event": "init", "model_id": MODEL_V3,
+            "output_format": {"format": "mp3", "sample_rate": 24000, "bit_rate": 64000},
+            "voice_settings": {"speed": rate_to_multiplier(profile.get("speech_rate", 0)),
+                               "volume": rate_to_multiplier(profile.get("loudness_rate", 0))},
+            "enable_subtitle": False}
+
+
+async def receive_v3(socket) -> dict:
+    frame = await asyncio.wait_for(socket.recv(), timeout=120)
+    if not isinstance(frame, str):
+        raise TtsError("Unexpected binary frame from TTS 3.0")
+    try:
+        message = json.loads(frame)
+    except ValueError:
+        raise TtsError("Invalid JSON from TTS 3.0") from None
+    if message.get("event") == "error":
+        error = message.get("error") or {}
+        raise TtsError(f"TTS 3.0 service error: {error.get('type')}/{error.get('code')} (request_id {error.get('request_id')})")
+    return message
+
+
+async def stream_session_v3(socket, text: str, profile: dict, target) -> int:
+    await socket.send(json.dumps(v3_init(profile), ensure_ascii=False))
+    if (await receive_v3(socket)).get("event") != "ready":
+        raise TtsError("Unexpected TTS 3.0 session state")
+    async def send_text():
+        for chunk in text_chunks(text):
+            await socket.send(json.dumps({"event": "text", "content": chunk}, ensure_ascii=False))
+            await asyncio.sleep(0)
+        # close submits the remaining text; no flush keeps a single MP3 stream.
+        await socket.send(json.dumps({"event": "close"}))
+    sender = asyncio.create_task(send_text())
+    size = 0
+    try:
+        while True:
+            message = await receive_v3(socket)
+            event = message.get("event")
+            if event == "audio":
+                try:
+                    chunk = base64.b64decode(message.get("audio") or "", validate=True)
+                except ValueError:
+                    raise TtsError("Invalid audio payload from TTS 3.0") from None
+                target.write(chunk)
+                size += len(chunk)
+            elif event == "final":
+                if message.get("reason") == "TTS_STREAM_FINAL_REASON_CLOSED":
+                    await sender
+                    if not size:
+                        raise TtsError("TTS completed without audio")
+                    return size
+            elif event != "alignment":
+                raise TtsError("Unexpected TTS 3.0 response event")
+    finally:
+        if not sender.done():
+            sender.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await sender
+
+
 async def synthesize(text: str, profile: dict, key: str, partial: Path) -> None:
     from websockets.asyncio.client import connect
-    headers = {"X-Api-Key": key, "X-Api-Resource-Id": profile["resource_id"],
-               "X-Api-Connect-Id": str(uuid.uuid4())}
+    if profile["resource_id"] == "seed-tts-3.0":
+        url = URL_V3.format(voice=quote(profile["speaker"], safe=""))
+        headers = {"X-Api-Key": key, "X-Request-Id": str(uuid.uuid4())}
+        session = stream_session_v3
+    else:
+        url, session = URL, stream_session
+        headers = {"X-Api-Key": key, "X-Api-Resource-Id": profile["resource_id"],
+                   "X-Api-Connect-Id": str(uuid.uuid4())}
     # A single connection attempt; never use connect as an automatic-retry iterator.
-    async with connect(URL, additional_headers=headers, open_timeout=30, close_timeout=5,
+    async with connect(url, additional_headers=headers, open_timeout=30, close_timeout=5,
                        max_size=10 * 1024 * 1024) as socket:
         with partial.open("xb") as output:
-            await asyncio.wait_for(stream_session(socket, text, profile, output), timeout=1800)
+            await asyncio.wait_for(session(socket, text, profile, output), timeout=1800)
 
 
 def validate_audio(path: Path, ffprobe: str, ffmpeg: str) -> float:
@@ -213,7 +290,7 @@ def main() -> int:
         profile = (validate_profile({"speaker": args.speaker, "resource_id": args.resource_id, "model": args.model})
                    if args.speaker or args.resource_id or args.model else load_profile())
         report = {"voice": profile, "text_sha256": hashlib.sha256(text.encode()).hexdigest(),
-                  "characters": len(text), "protocol": "doubao-v3-bidirectional-websocket"}
+                  "characters": len(text), "protocol": ("doubao-tts-3.0-streaming-input-websocket" if profile["resource_id"] == "seed-tts-3.0" else "doubao-v3-bidirectional-websocket")}
         if args.dry_run:
             print(json.dumps(dict(report, network=False, billable_request_sent=False), ensure_ascii=False))
             return 0

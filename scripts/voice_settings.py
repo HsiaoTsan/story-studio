@@ -11,7 +11,8 @@ import uuid
 
 from studio_runtime import ROOT, data_dir
 
-RESOURCES = {"seed-tts-2.0", "seed-icl-2.0"}
+# seed-tts-3.0 selects the separate Doubao TTS 3.0 streaming-input WebSocket (model_id doubao-seed-tts-3.0).
+RESOURCES = {"seed-tts-2.0", "seed-icl-2.0", "seed-tts-3.0"}
 
 
 class VoiceConfigError(ValueError):
@@ -41,7 +42,7 @@ def validate_profile(profile: dict) -> dict:
     if not isinstance(speaker, str) or not speaker.strip() or any(c.isspace() for c in speaker):
         raise VoiceConfigError("A nonempty speaker ID without whitespace is required")
     if profile.get("resource_id") not in RESOURCES:
-        raise VoiceConfigError("Select seed-tts-2.0 or seed-icl-2.0 for this V3 adapter")
+        raise VoiceConfigError("Select seed-tts-2.0, seed-icl-2.0 or seed-tts-3.0")
     model = profile.get("model")
     if model is not None and (not isinstance(model, str) or not model.strip() or any(c.isspace() for c in model)):
         raise VoiceConfigError("Model must be a nonempty model ID")
